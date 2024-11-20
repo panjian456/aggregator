@@ -4,29 +4,24 @@
 # @Time    : 2022-07-15
 
 import argparse
-import base64
-import copy
 import itertools
-import json
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import time
-from copy import deepcopy
-from dataclasses import dataclass, field
 
 import crawl
 import executable
-import location
 import push
 import utils
 import workflow
 import yaml
 from airport import AirPort
 from logger import logger
-from origin import Origin
+from urlvalidator import isurl
 from workflow import TaskConfig
 
 import clash
@@ -34,731 +29,461 @@ import subconverter
 
 PATH = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
 
-
-@dataclass
-class ProcessConfig(object):
-    # task list
-    tasks: list[dict] = field(default_factory=list)
-
-    # crawl config
-    crawl: dict = field(default_factory=dict)
-
-    # persist config
-    storage: dict = field(default_factory=dict)
-
-    # groups config
-    groups: dict[dict] = field(default_factory=dict)
-
-    # update config
-    update: dict = field(default_factory=dict)
-
-    # max acceptable delay
-    delay: int = 5000
-
-
-def load_configs(
-    url: str,
-    only_check: bool = False,
-    num_threads: int = 0,
-    display: bool = True,
-) -> ProcessConfig:
-    def parse_config(config: dict) -> None:
-        tasks.extend(config.get("domains", []))
-        groups.update(config.get("groups", {}))
-        update_conf.update(config.get("update", {}))
-        crawl_conf.update(config.get("crawl", {}))
-        storage.update(config.get("storage", {}))
-
-        nonlocal engine
-        engine = utils.trim(storage.get("engine", "")) or engine
-
-        nonlocal delay
-        delay = min(delay, max(config.get("delay", sys.maxsize), 50))
-
-        if only_check:
-            return
-
-        # global exclude
-        params["exclude"] = crawl_conf.get("exclude", "")
-
-        # persistence configuration
-        persist = {k: storage.get("items", {}).get(v, {}) for k, v in crawl_conf.get("persist", {}).items()}
-        persist["engine"] = engine
-        params["persist"] = persist
-
-        params["config"] = crawl_conf.get("config", {})
-        params["enable"] = crawl_conf.get("enable", True)
-        params["singlelink"] = crawl_conf.get("singlelink", False)
-
-        threshold = max(crawl_conf.get("threshold", 1), 1)
-        params["threshold"] = threshold
-        spiders = deepcopy(crawl_conf)
-
-        # spider's config for telegram
-        telegram_conf = spiders.get("telegram", {})
-        users = telegram_conf.pop("users", {})
-        telegram_conf["pages"] = max(telegram_conf.get("pages", 1), 1)
-        if telegram_conf.pop("enable", True) and users:
-            enabled_users, common_exclude = {}, telegram_conf.pop("exclude", "")
-            for k, v in users.items():
-                exclude = v.get("exclude", "").strip()
-                v["exclude"] = f"{exclude}|{common_exclude}".removeprefix("|") if common_exclude else exclude
-                v["push_to"] = list(set(v.get("push_to", [])))
-
-                enabled_users[k] = v
-            telegram_conf["users"] = enabled_users
-            params["telegram"] = telegram_conf
-
-        # spider's config for google
-        google_conf = spiders.get("google", {})
-        push_to = list(set(google_conf.get("push_to", [])))
-        if google_conf.pop("enable", True) and push_to:
-            google_conf["push_to"] = push_to
-            params["google"] = google_conf
-
-        # spider's config for yandex
-        yandex_conf = spiders.get("yandex", {})
-        push_to = list(set(yandex_conf.get("push_to", [])))
-        if yandex_conf.pop("enable", True) and push_to:
-            yandex_conf["push_to"] = push_to
-            params["yandex"] = yandex_conf
-
-        # spider's config for github
-        github_conf = spiders.get("github", {})
-        push_to = list(set(github_conf.get("push_to", [])))
-        spams = list(set(github_conf.get("spams", [])))
-        if github_conf.pop("enable", True) and push_to:
-            github_conf["pages"] = max(github_conf.get("pages", 1), 1)
-            github_conf["push_to"] = push_to
-            github_conf["spams"] = spams
-            params["github"] = github_conf
-
-        # spider's config for twitter
-        twitter_conf = spiders.get("twitter", {})
-        users = twitter_conf.pop("users", {})
-        if twitter_conf.pop("enable", True) and users:
-            enabled_users = {}
-            for k, v in users.items():
-                if utils.isblank(k) or not v or type(v) != dict or not v.pop("enable", True):
-                    continue
-
-                v["push_to"] = list(set(v.get("push_to", [])))
-                enabled_users[k] = v
-
-            params["twitter"] = enabled_users
-
-        # spider's config for github's repositories
-        repo_conf, repositories = spiders.get("repositories", []), {}
-        for repo in repo_conf:
-            enable = repo.pop("enable", True)
-            username = repo.get("username", "").strip()
-            repo_name = repo.get("repo_name", "").strip()
-            if not enable or not username or not repo_name:
-                continue
-
-            key = "/".join([username, repo_name])
-            push_to = list(set(repo.get("push_to", [])))
-            repo["username"] = username
-            repo["repo_name"] = repo_name
-            repo["commits"] = max(repo.get("commits", 3), 1)
-            repo["push_to"] = push_to
-
-            repositories[key] = repo
-        params["repositories"] = repositories
-
-        # spider's config for specified page
-        pages_conf, pages = spiders.get("pages", []), {}
-        for page in pages_conf:
-            enable = page.pop("enable", True)
-            url = page.get("url", "")
-            push_to = list(set(page.get("push_to", [])))
-            if not enable or not url or not push_to:
-                continue
-
-            multiple = page.pop("multiple", False)
-            if not multiple:
-                page["push_to"] = push_to
-                if isinstance(url, str):
-                    pages[url] = page
-                elif isinstance(url, list):
-                    for u in url:
-                        u = utils.trim(u)
-                        if u:
-                            pages[u] = page
-            else:
-                placeholder = utils.trim(page.pop("placeholder", ""))
-                if not placeholder or placeholder not in url or not isinstance(url, str):
-                    continue
-
-                # page number range
-                start, end = -1, -1
-                try:
-                    start = int(page.pop("start", 1))
-                    end = int(page.pop("end", 1))
-                except:
-                    pass
-
-                if start < 0 or end < start:
-                    continue
-
-                for i in range(start, end + 1):
-                    copypage = deepcopy(page)
-                    link = url.replace(placeholder, str(i))
-                    copypage["url"] = link
-                    copypage["push_to"] = push_to
-                    pages[link] = copypage
-
-        params["pages"] = pages
-
-        # spider's config for scripts
-        scripts_conf, scripts = spiders.get("scripts", []), {}
-
-        for script in scripts_conf:
-            enable = script.pop("enable", True)
-            path = script.pop("script", "").strip()
-            if not enable or not path:
-                continue
-
-            task_conf = script.get("params", {})
-            if not isinstance(task_conf, dict):
-                task_conf = {}
-
-            # record storge engine
-            task_conf["engine"] = engine
-
-            scripts[path] = task_conf
-        params["scripts"] = scripts
-
-    def verify(storage: dict, groups: dict) -> bool:
-        if not isinstance(storage, dict) or not isinstance(groups, dict):
-            return False
-
-        pushtool = push.get_instance(engine=storage.get("engine", ""))
-        if not isinstance(storage.get("items", {}), dict):
-            logger.error(f"cannot found any valid storage config")
-            return False
-
-        items = pushtool.filter_push(push_conf=storage.get("items", {}))
-        for name, group in groups.items():
-            name = utils.trim(name)
-
-            if not name or not isinstance(group, dict):
-                logger.error(f"invalid group config, name: {name}")
-                return False
-
-            targets = group.get("targets", {})
-            if not targets or not isinstance(targets, dict):
-                logger.error(f"group {name} should contain at least one type conversion")
-                return False
-
-            for category, storage_name in targets.items():
-                category = utils.trim(category).lower()
-                if category not in subconverter.CONVERT_TARGETS:
-                    logger.error(f"group {name} contains unsupported conversion type: {category}")
-                    return False
-
-                storage_name = utils.trim(storage_name)
-                if storage_name not in items:
-                    logger.error(f"missing storage configuration for group {name} to convert type to {category}")
-                    return False
-
-        return True
-
-    tasks, delay = [], sys.maxsize
-    engine, storage, groups = "", {}, {}
-    params, crawl_conf, update_conf = {}, {}, {}
-
-    try:
-        if re.match(
-            r"^(https?:\/\/(([a-zA-Z0-9]+-?)+[a-zA-Z0-9]+\.)+[a-zA-Z]+)(:\d+)?(\/.*)?(\?.*)?(#.*)?$",
-            url,
-        ):
-            headers = {"User-Agent": utils.USER_AGENT, "Referer": url}
-            content = utils.http_get(url=url, headers=headers)
-            if not content:
-                logger.error(f"cannot fetch config from remote, url: {utils.hide(url=url)}")
-            else:
-                os.environ["SUBSCRIBE_CONF"] = url
-                parse_config(json.loads(content))
-        else:
-            localfile = os.path.abspath(url)
-            if os.path.exists(localfile) and os.path.isfile(localfile):
-                config = json.loads(open(localfile, "r", encoding="utf8").read())
-                os.environ["SUBSCRIBE_CONF"] = localfile
-                parse_config(config)
-
-        # check configuration
-        if not verify(storage=storage, groups=groups):
-            raise ValueError(f"there are some errors in the configuration, please check and confirm")
-
-        # execute crawl tasks
-        if params:
-            result = crawl.batch_crawl(conf=params, num_threads=num_threads, display=display)
-            tasks.extend(result)
-    except SystemExit as e:
-        if e.code != 0:
-            logger.error("parse configuration failed due to process abnormally exits")
-
-        sys.exit(e.code)
-    except:
-        logger.error("occur error when load task config")
-        sys.exit(0)
-
-    return ProcessConfig(
-        tasks=tasks,
-        crawl=crawl_conf,
-        storage=storage,
-        groups=groups,
-        update=update_conf,
-        delay=delay,
-    )
+DATA_BASE = os.path.join(PATH, "data")
 
 
 def assign(
-    pc: ProcessConfig,
-    retry: int,
     bin_name: str,
-    remain: bool,
-    pushtool: push.PushTo,
-    only_check=False,
+    domains_file: str = "",
+    overwrite: bool = False,
+    pages: int = sys.maxsize,
     rigid: bool = True,
-) -> tuple[list[TaskConfig], dict, list]:
-    if not isinstance(pc, ProcessConfig):
-        return [], {}, []
+    display: bool = True,
+    num_threads: int = 0,
+    **kwargs,
+) -> list[TaskConfig]:
+    def load_exist(username: str, gist_id: str, access_token: str, filename: str) -> list[str]:
+        if not filename:
+            return []
 
-    tasks, groups, arrays = [], {}, []
-    retry, globalid = max(1, retry), 0
+        subscriptions = set()
+
+        pattern = r"^https?:\/\/[^\s]+"
+        local_file = os.path.join(DATA_BASE, filename)
+        if os.path.exists(local_file) and os.path.isfile(local_file):
+            with open(local_file, "r", encoding="utf8") as f:
+                items = re.findall(pattern, str(f.read()), flags=re.M)
+                if items:
+                    subscriptions.update(items)
+
+        if username and gist_id and access_token:
+            push_tool = push.PushToGist(token=access_token)
+            url = push_tool.raw_url(push_conf={"username": username, "gistid": gist_id, "filename": filename})
+
+            content = utils.http_get(url=url, timeout=30)
+            items = re.findall(pattern, content, flags=re.M)
+            if items:
+                subscriptions.update(items)
+
+        logger.info("start checking whether existing subscriptions have expired")
+
+        # 过滤已过期订阅并返回
+        links = list(subscriptions)
+        results = utils.multi_thread_run(
+            func=crawl.check_status,
+            tasks=links,
+            num_threads=num_threads,
+            show_progress=display,
+        )
+
+        return [links[i] for i in range(len(links)) if results[i][0] and not results[i][1]]
+
+    def parse_domains(content: str) -> dict:
+        if not content or not isinstance(content, str):
+            logger.warning("cannot found any domain due to content is empty or not string")
+            return {}
+
+        records = {}
+        for line in content.split("\n"):
+            line = utils.trim(line)
+            if not line or line.startswith("#"):
+                continue
+
+            words = line.rsplit(delimiter, maxsplit=3)
+            address = utils.trim(words[0])
+            coupon = utils.trim(words[1]) if len(words) > 1 else ""
+            invite_code = utils.trim(words[2]) if len(words) > 2 else ""
+            api_prefix = utils.trim(words[3]) if len(words) > 3 else ""
+
+            records[address] = {"coupon": coupon, "invite_code": invite_code, "api_prefix": api_prefix}
+
+        return records
+
+    subscribes_file = utils.trim(kwargs.get("subscribes_file", ""))
+    access_token = utils.trim(kwargs.get("access_token", ""))
+    gist_id = utils.trim(kwargs.get("gist_id", ""))
+    username = utils.trim(kwargs.get("username", ""))
+    chuck = kwargs.get("chuck", False)
+
+    # 加载已有订阅
+    subscriptions = load_exist(username, gist_id, access_token, subscribes_file)
+    logger.info(f"load exists subscription finished, count: {len(subscriptions)}")
 
     # 是否允许特殊协议
     special_protocols = AirPort.enable_special_protocols()
 
-    sites = [] if not isinstance(pc.tasks, list) else deepcopy(pc.tasks)
-    for site in sites:
-        if not site:
-            continue
+    tasks = (
+        [
+            TaskConfig(name=utils.random_chars(length=8), sub=x, bin_name=bin_name, special_protocols=special_protocols)
+            for x in subscriptions
+            if x
+        ]
+        if subscriptions
+        else []
+    )
 
-        name = site.get("name", "").strip().lower()
-        domain = site.get("domain", "").strip().lower()
+    # 仅更新已有订阅
+    if tasks and kwargs.get("refresh", False):
+        logger.info("skip registering new accounts, will use existing subscriptions for refreshing")
+        return tasks
 
-        # 订阅地址，支持单个或多个
-        subscribe = site.get("sub", "")
-        if isinstance(subscribe, str):
-            subscribe = [subscribe.strip()]
-        subscribe = [s for s in subscribe if s.strip() != ""]
-        if len(subscribe) >= 2:
-            subscribe = list(set(subscribe))
+    domains, delimiter = {}, "@#@#"
+    domains_file = utils.trim(domains_file)
+    if not domains_file:
+        domains_file = "domains.txt"
 
-        # 自定义标签，追加到名称前
-        tag = site.get("tag", "").strip().upper()
+    # 加载已有站点列表
+    fullpath = os.path.join(DATA_BASE, domains_file)
+    if os.path.exists(fullpath) and os.path.isfile(fullpath):
+        with open(fullpath, "r", encoding="UTF8") as f:
+            domains.update(parse_domains(content=str(f.read())))
 
-        # 节点倍率超过该值将会被丢弃
-        rate = float(site.get("rate", 3.0))
+    # 爬取新站点列表
+    if not domains or overwrite:
+        candidates = crawl.collect_airport(
+            channel="jichang_list",
+            page_num=pages,
+            num_thread=num_threads,
+            rigid=rigid,
+            display=display,
+            filepath=os.path.join(DATA_BASE, "coupons.txt"),
+            delimiter=delimiter,
+            chuck=chuck,
+        )
 
-        # 需要注册账号的个数
-        num = min(max(1, int(site.get("count", 1))), 10)
+        if candidates:
+            for k, v in candidates.items():
+                item = domains.get(k, {})
+                item.update(v)
 
-        # 如果订阅链接不为空，num为订阅链接数
-        num = len(subscribe) if subscribe else num
+                domains[k] = item
 
-        # 组名列表
-        push_names = site.get("push_to", [])
+            overwrite = True
 
-        # 失败次数，超过该值将不再尝试注册
-        errors = max(site.get("errors", 0), 0) + 1
+    # 加载自定义机场列表
+    customize_link = utils.trim(kwargs.get("customize_link", ""))
+    if customize_link:
+        if isurl(customize_link):
+            domains.update(parse_domains(content=utils.http_get(url=customize_link)))
+        else:
+            local_file = os.path.join(DATA_BASE, customize_link)
+            if local_file != fullpath and os.path.exists(local_file) and os.path.isfile(local_file):
+                with open(local_file, "r", encoding="UTF8") as f:
+                    domains.update(parse_domains(content=str(f.read())))
 
-        # 来源类别
-        source = site.get("origin", "")
+    if not domains:
+        logger.error("cannot collect any new airport for free use")
+        return tasks
 
-        # 重命名规则，正常正则表达式
-        rename = site.get("rename", "")
+    if overwrite:
+        crawl.save_candidates(candidates=domains, filepath=fullpath, delimiter=delimiter)
 
-        # 排除匹配到的节点，支持正则表达式
-        exclude = site.get("exclude", "").strip()
-
-        # 仅保留匹配到的节点，支持正则表达式
-        include = site.get("include", "").strip()
-
-        # 是否检查 ChatGPT 的连通性
-        chatgpt = site.get("chatgpt", {})
-
-        # 是否对节点测活
-        liveness = site.get("liveness", True)
-
-        # 拒绝跳过证书验证
-        disable_insecure = site.get("secure", False)
-
-        # 优惠码
-        coupon = utils.trim(site.get("coupon", ""))
-
-        # 邀请码
-        invite_code = utils.trim(site.get("invite_code", ""))
-
-        # 覆盖subconverter默认exclude规则
-        ignoreder = site.get("ignorede", False)
-
-        # 需要人机验证时是否直接放弃
-        chuck = site.get("chuck", False)
-
-        # 接口地址前缀
-        api_prefix = site.get("api_prefix", "")
-
-        if not source:
-            source = Origin.TEMPORARY.name if not domain else Origin.OWNED.name
-        site["origin"] = source
-
-        if source != Origin.TEMPORARY.name:
-            site["errors"] = errors
-
-        site["name"] = name.rsplit(crawl.SEPARATOR, maxsplit=1)[0]
-        arrays.append(site)
-
-        renews = copy.deepcopy(site.get("renew", {}))
-        accounts = renews.pop("account", [])
-
-        # 如果renew不为空，num为配置的renew账号数
-        num = len(accounts) if accounts else num
-
-        if not site.get("enable", True) or "" == name or ("" == domain and not subscribe) or num <= 0:
-            continue
-
-        for i in range(num):
-            index = -1 if num == 1 else i + 1
-            sub = subscribe[i] if subscribe else ""
-            renew = {"coupon_code": coupon} if coupon else {}
-
-            globalid += 1
-            if accounts:
-                renew.update(accounts[i])
-                renew.update(renews)
-
-            if renew and api_prefix:
-                renew["api_prefix"] = api_prefix
-
-            task = TaskConfig(
+    for domain, param in domains.items():
+        name = crawl.naming_task(url=domain)
+        tasks.append(
+            TaskConfig(
                 name=name,
-                taskid=globalid,
                 domain=domain,
-                sub=sub,
-                index=index,
-                retry=retry,
-                rate=rate,
+                coupon=param.get("coupon", ""),
+                invite_code=param.get("invite_code", ""),
+                api_prefix=param.get("api_prefix", ""),
                 bin_name=bin_name,
-                tag=tag,
-                renew=renew,
-                rename=rename,
-                exclude=exclude,
-                include=include,
-                chatgpt=chatgpt,
-                liveness=liveness,
-                coupon=coupon,
-                disable_insecure=disable_insecure,
-                ignorede=ignoreder,
                 rigid=rigid,
                 chuck=chuck,
                 special_protocols=special_protocols,
-                invite_code=invite_code,
-                api_prefix=api_prefix,
             )
-            found = workflow.exists(tasks=tasks, task=task)
-            if found:
-                continue
+        )
 
-            tasks.append(task)
-            for push_name in push_names:
-                if push_name not in pc.groups:
-                    logger.error(f"cannot found push config, name=[{push_name}]\tsite=[{name}]")
-                    continue
-
-                taskids = groups.get(push_name, [])
-                taskids.append(globalid)
-                groups[push_name] = taskids
-
-    if (remain or only_check) and pc.groups:
-        if only_check:
-            # clean all extra tasks
-            tasks, groups, globalid = [], {k: [] for k in groups.keys()}, 0
-
-        for k, v in pc.groups.items():
-            taskids = groups.get(k, [])
-            targets = v.get("targets", {})
-            if not targets:
-                continue
-
-            # get the first conversion configuration for each group
-            push_conf = pc.storage.get("items", {}).get(targets.values()[0], {})
-            subscribe = pushtool.raw_url(push_conf=push_conf)
-            if k not in groups or not subscribe:
-                continue
-
-            globalid += 1
-            tasks.append(
-                TaskConfig(
-                    name=f"remains-{k}",
-                    taskid=globalid,
-                    sub=subscribe,
-                    index=-1,
-                    retry=retry,
-                    bin_name=bin_name,
-                    special_protocols=special_protocols,
-                )
-            )
-            taskids.append(globalid)
-            groups[k] = taskids
-    return tasks, groups, arrays
+    return tasks
 
 
 def aggregate(args: argparse.Namespace) -> None:
-    if not args or not isinstance(args, argparse.Namespace):
-        return
+    def parse_gist_link(link: str) -> tuple[str, str]:
+        # 提取 gist 用户名及 id
+        words = utils.trim(link).split("/", maxsplit=1)
+        if len(words) != 2:
+            logger.error(f"cannot extract username and gist id due to invalid github gist link")
+            return "", ""
+
+        return utils.trim(words[0]), utils.trim(words[1])
 
     clash_bin, subconverter_bin = executable.which_bin()
     display = not args.invisible
 
-    # parse config
-    server = utils.trim(args.server) or os.environ.get("SUBSCRIBE_CONF", "").strip()
-    process_config = load_configs(
-        url=server,
-        only_check=args.check,
-        num_threads=args.num,
-        display=display,
-    )
+    subscribes_file = "subscribes.txt"
+    access_token = utils.trim(args.key)
+    username, gist_id = parse_gist_link(args.gist)
 
-    storages = process_config.storage or {}
-    pushtool = push.get_instance(engine=storages.get("engine", ""))
-    retry = min(max(1, args.retry), 10)
-
-    # generate tasks
-    tasks, groups, sites = assign(
-        pc=process_config,
-        retry=retry,
+    tasks = assign(
         bin_name=subconverter_bin,
-        remain=not args.overwrite,
-        pushtool=pushtool,
-        only_check=args.check,
-        rigid=not args.flexible,
+        domains_file="domains.txt",
+        overwrite=args.overwrite,
+        pages=args.pages,
+        rigid=not args.easygoing,
+        display=display,
+        num_threads=args.num,
+        refresh=args.refresh,
+        chuck=args.chuck,
+        username=username,
+        gist_id=gist_id,
+        access_token=access_token,
+        subscribes_file=subscribes_file,
+        customize_link=args.yourself,
     )
+
     if not tasks:
         logger.error("cannot found any valid config, exit")
         sys.exit(0)
 
-    # fetch all subscriptions
+    # 已有订阅已经做过过期检查，无需再测
+    old_subscriptions = set([t.sub for t in tasks if t.sub])
+
+    logger.info(f"start generate subscribes information, tasks: {len(tasks)}")
     generate_conf = os.path.join(PATH, "subconverter", "generate.ini")
     if os.path.exists(generate_conf) and os.path.isfile(generate_conf):
         os.remove(generate_conf)
 
-    logger.info(f"start fetch all subscriptions, count: [{len(tasks)}]")
-    results = utils.multi_process_run(func=workflow.executewrapper, tasks=tasks)
+    results = utils.multi_thread_run(func=workflow.executewrapper, tasks=tasks, num_threads=args.num)
+    proxies = list(itertools.chain.from_iterable([x[1] for x in results if x]))
 
-    subscribes, datasets = {}, {}
-    for i in range(len(results)):
-        data = results[i]
-        if not data or data[0] < 0 or not data[1]:
-            # not contain any proxy
-            if tasks[i] and tasks[i].sub:
-                subscribes[tasks[i].sub] = False
-            continue
+    if len(proxies) == 0:
+        logger.error("exit because cannot fetch any proxy node")
+        sys.exit(0)
 
-        datasets[data[0]] = data[1]
+    nodes, workspace = [], os.path.join(PATH, "clash")
 
-    for k, v in groups.items():
-        if not v:
-            logger.error(f"task is empty, group=[{k}]")
-            continue
-
-        arrays = [datasets.get(x, []) for x in v]
-        proxies = list(itertools.chain.from_iterable(arrays))
-        if len(proxies) == 0:
-            logger.error(f"exit because cannot fetch any proxy node, group=[{k}]")
-            continue
-
-        workspace = os.path.join(PATH, "clash")
+    if args.skip:
+        nodes = clash.filter_proxies(proxies).get("proxies", [])
+    else:
         binpath = os.path.join(workspace, clash_bin)
-        filename = "config.yaml"
-        proxies = clash.generate_config(workspace, proxies, filename)
+        confif_file = "config.yaml"
+        proxies = clash.generate_config(workspace, list(proxies), confif_file)
 
-        # filer
-        skip = utils.trim(os.environ.get("SKIP_ALIVE_CHECK", "false")).lower() in ["true", "1"]
-        nochecks, starttime = proxies, time.time()
+        # 可执行权限
+        utils.chmod(binpath)
 
-        if not skip:
-            checks, nochecks = workflow.liveness_fillter(proxies=proxies)
-            if checks:
-                # executable
-                utils.chmod(binpath)
+        logger.info(f"startup clash now, workspace: {workspace}, config: {confif_file}")
+        process = subprocess.Popen(
+            [
+                binpath,
+                "-d",
+                workspace,
+                "-f",
+                os.path.join(workspace, confif_file),
+            ]
+        )
+        logger.info(f"clash start success, begin check proxies, num: {len(proxies)}")
 
-                logger.info(f"startup clash now, workspace: {workspace}, config: {filename}")
-                process = subprocess.Popen(
-                    [
-                        binpath,
-                        "-d",
-                        workspace,
-                        "-f",
-                        os.path.join(workspace, filename),
-                    ]
-                )
+        time.sleep(random.randint(3, 6))
+        params = [
+            [p, clash.EXTERNAL_CONTROLLER, 5000, args.url, args.delay, False] for p in proxies if isinstance(p, dict)
+        ]
 
-                logger.info(f"clash start success, begin check proxies, group: {k}\tcount: {len(checks)}")
-                time.sleep(random.randint(5, 8))
+        masks = utils.multi_thread_run(
+            func=clash.check,
+            tasks=params,
+            num_threads=args.num,
+            show_progress=display,
+        )
 
-                params = [
-                    [p, clash.EXTERNAL_CONTROLLER, args.timeout, args.url, process_config.delay, False]
-                    for p in checks
-                    if isinstance(p, dict)
-                ]
+        # 关闭clash
+        try:
+            process.terminate()
+        except:
+            logger.error(f"terminate clash process error")
 
-                # check
-                masks = utils.multi_thread_run(
-                    func=clash.check,
-                    tasks=params,
-                    num_threads=args.num,
-                    show_progress=display,
-                )
+        nodes = [proxies[i] for i in range(len(proxies)) if masks[i]]
+        if len(nodes) <= 0:
+            logger.error(f"cannot fetch any proxy")
+            sys.exit(0)
 
-                # close clash client
-                try:
-                    process.terminate()
-                except:
-                    logger.error(f"terminate clash process error, group: {k}")
+    subscriptions = set()
+    for p in proxies:
+        # 移除无用的标记
+        p.pop("chatgpt", False)
+        p.pop("liveness", True)
 
-                availables = [checks[i] for i in range(len(checks)) if masks[i]]
-                nochecks.extend(availables)
+        sub = p.pop("sub", "")
+        if sub:
+            subscriptions.add(sub)
 
-                dead = len(checks) - len(availables)
-                logger.info(f"proxies check finished, total: {len(checks)}, alive: {len(availables)}, dead: {dead}")
+    data = {"proxies": nodes}
+    urls = list(subscriptions)
+    source = "proxies.yaml"
 
-        for item in nochecks:
-            item.pop("sub", "")
+    # 如果文件夹不存在则创建
+    os.makedirs(DATA_BASE, exist_ok=True)
 
-        if len(nochecks) <= 0:
-            logger.error(f"cannot fetch any proxy, group=[{k}], cost: {time.time()-starttime:.2f}s")
+    supplier = os.path.join(PATH, "subconverter", source)
+    if os.path.exists(supplier) and os.path.isfile(supplier):
+        os.remove(supplier)
+
+    with open(supplier, "w+", encoding="utf8") as f:
+        yaml.add_representer(clash.QuotedStr, clash.quoted_scalar)
+        yaml.dump(data, f, allow_unicode=True)
+
+    if os.path.exists(generate_conf) and os.path.isfile(generate_conf):
+        os.remove(generate_conf)
+
+    targets, records = [], {}
+    for target in args.targets:
+        target = utils.trim(target).lower()
+        convert_name = f'convert_{target.replace("&", "_").replace("=", "_")}'
+
+        filename = subconverter.get_filename(target=target)
+        list_only = False if target == "v2ray" or target == "mixed" or "ss" in target else not args.all
+        targets.append((convert_name, filename, target, list_only, args.vitiate))
+
+    for t in targets:
+        success = subconverter.generate_conf(generate_conf, t[0], source, t[1], t[2], True, t[3], t[4])
+        if not success:
+            logger.error(f"cannot generate subconverter config file for target: {t[2]}")
             continue
 
-        group_conf = process_config.groups.get(k, {})
-        emoji = group_conf.get("emoji", True)
-        list_only = group_conf.get("list", True)
+        if subconverter.convert(binname=subconverter_bin, artifact=t[0]):
+            filepath = os.path.join(DATA_BASE, t[1])
+            shutil.move(os.path.join(PATH, "subconverter", t[1]), filepath)
 
-        regularize = group_conf.get("regularize", {})
-        if regularize and isinstance(regularize, dict) and regularize.get("enable", False):
-            locate = regularize.get("locate", False)
-            try:
-                bits = max(1, int(regularize.get("bits", 2)))
-            except:
-                bits = 2
+            records[t[1]] = filepath
 
-            nochecks = location.regularize(
-                proxies=nochecks,
-                num_threads=args.num,
-                show_progress=display,
-                locate=locate,
-                digits=bits,
-            )
+    if len(records) > 0:
+        os.remove(supplier)
+    else:
+        logger.error(f"all targets convert failed, you can view the temporary file: {supplier}")
+        sys.exit(1)
 
-        source_file, data = "config.yaml", {"proxies": nochecks}
-        filepath = os.path.join(PATH, "subconverter", source_file)
-        with open(filepath, "w+", encoding="utf8") as f:
-            yaml.add_representer(clash.QuotedStr, clash.quoted_scalar)
-            yaml.dump(data, f, allow_unicode=True)
+    logger.info(f"found {len(nodes)} proxies, save it to {list(records.values())}")
 
-        targets = group_conf.get("targets", {})
-        for target, storage_name in targets.items():
-            persisted, content = False, " "
+    life, traffic = max(0, args.life), max(0, args.flow)
+    if life > 0 or traffic > 0:
+        # 过滤出新的订阅并检查剩余流量和过期时间是否满足要求
+        new_subscriptions = [x for x in urls if x not in old_subscriptions]
 
-            # convert
-            artifact = f"convert_{target}"
-            dest_file = subconverter.get_filename(target=target)
+        tasks = [[x, 2, traffic, life, 0, True] for x in new_subscriptions]
+        results = utils.multi_thread_run(
+            func=crawl.check_status,
+            tasks=tasks,
+            num_threads=args.num,
+            show_progress=display,
+        )
 
-            if os.path.exists(generate_conf) and os.path.isfile(generate_conf):
-                os.remove(generate_conf)
+        total = len(urls)
 
-            success = subconverter.generate_conf(
-                filepath=generate_conf,
-                name=artifact,
-                source=source_file,
-                dest=dest_file,
-                target=target,
-                emoji=emoji,
-                list_only=list_only,
-            )
-            if not success:
-                logger.error(f"cannot generate subconverter config file, group: {k}, target: {target}")
-                continue
+        # 筛选出为符合要求的订阅
+        urls = [new_subscriptions[i] for i in range(len(new_subscriptions)) if results[i][0] and not results[i][1]]
+        discard = len(tasks) - len(urls)
 
-            if subconverter.convert(binname=subconverter_bin, artifact=artifact):
-                filepath = os.path.join(PATH, "subconverter", dest_file)
+        # 合并新老订阅
+        urls.extend(list(old_subscriptions))
 
-                if not os.path.exists(filepath) or not os.path.isfile(filepath):
-                    logger.error(f"converted file {filepath} not found, group: {k}, target: {target}")
-                    continue
+        logger.info(f"filter subscriptions finished, total: {total}, found: {len(urls)}, discard: {discard}")
 
-                with open(filepath, "r", encoding="utf8") as f:
-                    content = f.read()
+    utils.write_file(filename=os.path.join(DATA_BASE, subscribes_file), lines=urls)
+    domains = [utils.extract_domain(url=x, include_protocal=True) for x in urls]
 
-                mixed = target == "v2ray" or target == "mixed" or "ss" in target
-                if mixed and not utils.isb64encode(content=content):
-                    # base64 encode
-                    try:
-                        content = base64.b64encode(content.encode(encoding="UTF8")).decode(encoding="UTF8")
-                    except Exception as e:
-                        logger.error(f"base64 encode error, group: {k}, target: {target}, message: {str(e)}")
-                        continue
+    # 保存实际可使用的网站列表
+    utils.write_file(filename=os.path.join(DATA_BASE, "valid-domains.txt"), lines=list(set(domains)))
 
-                # save to remote server
-                push_conf = process_config.storage.get("items", {}).get(storage_name, {})
-                persisted = pushtool.push_to(content=content, push_conf=push_conf, group=f"{k}::{target}")
+    # 如有必要，上传至 Gist
+    if gist_id and access_token:
+        files, push_conf = {}, {"gistid": gist_id, "filename": list(records.keys())[0]}
 
-            # clean workspace
-            workflow.cleanup(os.path.join(PATH, "subconverter"), [dest_file, "generate.ini"])
+        for k, v in records.items():
+            if os.path.exists(v) and os.path.isfile(v):
+                with open(v, "r", encoding="utf8") as f:
+                    files[k] = {"content": f.read(), "filename": k}
 
-            if content and not persisted:
-                filename = os.path.join(PATH, "data", f"{k}-{dest_file}")
+        if urls:
+            files[subscribes_file] = {"content": "\n".join(urls), "filename": subscribes_file}
 
-                logger.error(f"storage config to remote failed, group: {k}, target: {target}, save it to {filename}")
-                utils.write_file(filename=filename, lines=content)
+        if files:
+            push_client = push.PushToGist(token=access_token)
 
-        workflow.cleanup(os.path.join(PATH, "subconverter"), [source_file])
-        cost = "{:.2f}s".format(time.time() - starttime)
-        logger.info(f"group [{k}] process finished, count: {len(nochecks)}, cost: {cost}")
+            # 上传
+            success = push_client.push_to(content="", push_conf=push_conf, payload={"files": files}, group="collect")
+            if success:
+                logger.info(f"upload proxies and subscriptions to gist successed")
+            else:
+                logger.error(f"upload proxies and subscriptions to gist failed")
 
-    config = {
-        "domains": sites,
-        "crawl": process_config.crawl,
-        "groups": process_config.groups,
-        "storage": process_config.storage,
-        "update": process_config.update,
-    }
-    skip_remark = utils.trim(os.environ.get("SKIP_REMARK", "false")).lower() in ["true", "1"]
+    # 清理工作空间
+    workflow.cleanup(workspace, [])
 
-    workflow.refresh(config=config, push=pushtool, alives=dict(subscribes), skip_remark=skip_remark)
+
+class CustomHelpFormatter(argparse.HelpFormatter):
+    def _format_action_invocation(self, action):
+        if action.choices:
+            parts = []
+            if action.option_strings:
+                parts.extend(action.option_strings)
+
+                # 移除使用帮助信息中 -t 或 --targets 附带的过长的可选项信息
+                if action.nargs != 0 and action.option_strings != ["-t", "--targets"]:
+                    default = action.dest.upper()
+                    args_string = self._format_args(action, default)
+                    parts[-1] += " " + args_string
+            else:
+                args_string = self._format_args(action, action.dest)
+                parts.append(args_string)
+            return ", ".join(parts)
+        else:
+            return super()._format_action_invocation(action)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(formatter_class=CustomHelpFormatter)
+    parser.add_argument(
+        "-a",
+        "--all",
+        dest="all",
+        action="store_true",
+        default=False,
+        help="generate full configuration for clash",
+    )
 
     parser.add_argument(
         "-c",
-        "--check",
-        dest="check",
+        "--chuck",
+        dest="chuck",
         action="store_true",
         default=False,
-        help="only check proxies are alive",
+        help="discard candidate sites that may require human-authentication",
+    )
+
+    parser.add_argument(
+        "-d",
+        "--delay",
+        type=int,
+        required=False,
+        default=5000,
+        help="proxies max delay allowed",
     )
 
     parser.add_argument(
         "-e",
-        "--envrionment",
-        type=str,
-        required=False,
-        default=".env",
-        help="environment file name",
+        "--easygoing",
+        dest="easygoing",
+        action="store_true",
+        default=False,
+        help="try registering with a gmail alias when you encounter a whitelisted mailbox",
     )
 
     parser.add_argument(
         "-f",
-        "--flexible",
-        dest="flexible",
-        action="store_true",
-        default=False,
-        help="try registering with a gmail alias when you encounter a whitelisted mailbox",
+        "--flow",
+        type=int,
+        required=False,
+        default=0,
+        help="remaining traffic available for use, unit: GB",
+    )
+
+    parser.add_argument(
+        "-g",
+        "--gist",
+        type=str,
+        required=False,
+        default=os.environ.get("GIST_LINK", ""),
+        help="github username and gist id, separated by '/'",
     )
 
     parser.add_argument(
@@ -768,6 +493,24 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="don't show check progress bar",
+    )
+
+    parser.add_argument(
+        "-k",
+        "--key",
+        type=str,
+        required=False,
+        default=os.environ.get("GIST_PAT", ""),
+        help="github personal access token for editing gist",
+    )
+
+    parser.add_argument(
+        "-l",
+        "--life",
+        type=int,
+        required=False,
+        default=0,
+        help="remaining life time, unit: hours",
     )
 
     parser.add_argument(
@@ -785,34 +528,43 @@ if __name__ == "__main__":
         dest="overwrite",
         action="store_true",
         default=False,
-        help="exclude remains proxies",
+        help="overwrite domains",
+    )
+
+    parser.add_argument(
+        "-p",
+        "--pages",
+        type=int,
+        required=False,
+        default=sys.maxsize,
+        help="max page number when crawling telegram",
     )
 
     parser.add_argument(
         "-r",
-        "--retry",
-        type=int,
-        required=False,
-        default=3,
-        help="retry times when http request failed",
+        "--refresh",
+        dest="refresh",
+        action="store_true",
+        default=False,
+        help="refresh and remove expired proxies with existing subscriptions",
     )
 
     parser.add_argument(
         "-s",
-        "--server",
-        type=str,
-        required=False,
-        default="",
-        help="remote config file",
+        "--skip",
+        dest="skip",
+        action="store_true",
+        default=False,
+        help="skip usability checks",
     )
 
     parser.add_argument(
         "-t",
-        "--timeout",
-        type=int,
-        required=False,
-        default=5000,
-        help="timeout",
+        "--targets",
+        nargs="+",
+        choices=subconverter.CONVERT_TARGETS,
+        default=["clash", "v2ray", "singbox"],
+        help=f"choose one or more generated profile type. default to clash, v2ray and singbox. supported: {subconverter.CONVERT_TARGETS}",
     )
 
     parser.add_argument(
@@ -824,7 +576,22 @@ if __name__ == "__main__":
         help="test url",
     )
 
-    args = parser.parse_args()
-    utils.load_dotenv(args.envrionment)
+    parser.add_argument(
+        "-v",
+        "--vitiate",
+        dest="vitiate",
+        action="store_true",
+        default=False,
+        help="ignoring default proxies filter rules",
+    )
 
-    aggregate(args=args)
+    parser.add_argument(
+        "-y",
+        "--yourself",
+        type=str,
+        required=False,
+        default=os.environ.get("CUSTOMIZE_LINK", ""),
+        help="the url to the list of airports that you maintain yourself",
+    )
+
+    aggregate(args=parser.parse_args())
